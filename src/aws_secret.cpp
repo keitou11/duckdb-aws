@@ -18,6 +18,7 @@
 #include <aws/core/Aws.h>
 #include <aws/core/auth/AWSCredentialsProviderChain.h>
 #include <aws/core/auth/GeneralHTTPCredentialsProvider.h>
+#include <aws/core/auth/LoginCredentialsProvider.h>
 #include <aws/core/auth/SSOCredentialsProvider.h>
 #include <aws/core/auth/STSCredentialsProvider.h>
 #include <aws/core/client/ClientConfiguration.h>
@@ -188,6 +189,27 @@ public:
 				} else {
 					AddProvider(std::make_shared<Aws::Auth::SSOCredentialsProvider>(profile.c_str(), sso_config));
 				}
+			} else if (item == "login") {
+				// Credentials from an `aws login` session: the profile's `login_session` key points at a
+				// cached session (default ~/.aws/login/cache, overridable via AWS_LOGIN_CACHE_DIRECTORY).
+				// https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-sign-in.html
+				// The SDK only adds this provider to DefaultAWSCredentialsProviderChain when that chain is
+				// constructed from a CredentialProviderConfiguration, so build one the same way: a
+				// profile-scoped ClientConfiguration resolves login_session, region and the cache override.
+				// IMDS is disabled so an unset region does not trigger an EC2 metadata lookup.
+				const Aws::String login_profile = profile.empty() ? Aws::Auth::GetConfigProfileName()
+				                                                  : Aws::String(profile.c_str());
+				Aws::Client::ClientConfiguration login_client_config(login_profile.c_str(), true);
+				auto login_config = login_client_config.ResolveCredentialProviderConfig();
+				// Skip profiles without a login_session: given an empty session, the CRT provider falls
+				// back to the login_session of the AWS_PROFILE / default profile, which would silently
+				// return credentials for a different profile than the one requested. The same holds when
+				// the profile is missing from the config file: ClientConfiguration then keeps the
+				// SDK-resolved profile name instead of ours.
+				if (login_client_config.profileName == login_profile &&
+				    !login_config.loginCredentialProviderConfig.loginSession.empty()) {
+					AddProvider(std::make_shared<Aws::Auth::LoginCredentialsProvider>(login_config));
+				}
 			} else if (item == "env") {
 				AddProvider(std::make_shared<Aws::Auth::EnvironmentAWSCredentialsProvider>());
 			} else if (item == "instance") {
@@ -300,8 +322,8 @@ static string ConstructErrorMessage(string chain, string profile, string assume_
 	// these chains "generate" new aws keys. See their documentation in the header file
 	// https://github.com/aws/aws-sdk-cpp/blob/main/src/aws-cpp-sdk-core/include/aws/core/auth/AWSCredentialsProvider.h
 	// if a roll is assumed, secrets are also "generated"
-	if (chain == "sts" || chain == "sso" || chain == "instance" || chain == "container" || chain == "process" ||
-	    chain == "web_identity" || !assume_role.empty()) {
+	if (chain == "sts" || chain == "sso" || chain == "login" || chain == "instance" || chain == "container" ||
+	    chain == "process" || chain == "web_identity" || !assume_role.empty()) {
 		verb = "generate";
 	}
 	string prefix = StringUtil::Format("Secret Validation Failure: during `%s` using the following:\n", verb);
